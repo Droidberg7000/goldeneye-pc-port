@@ -1,0 +1,84 @@
+name: Java ME toolchain probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Fetch and verify build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe-build/deps probe-build/classes
+          cd probe-build/deps
+          curl -fL --retry 2 --proto '=https' https://repo1.maven.org/maven2/org/eclipse/jdt/ecj/3.33.0/ecj-3.33.0.jar -o ecj.jar
+          curl -fL --retry 2 --proto '=https' https://repo1.maven.org/maven2/org/microemu/cldcapi11/2.0.4/cldcapi11-2.0.4.jar -o cldc.jar
+          curl -fL --retry 2 --proto '=https' https://repo1.maven.org/maven2/org/microemu/midpapi20/2.0.4/midpapi20-2.0.4.jar -o midp.jar
+          curl -fL --retry 2 --proto '=https' https://github.com/Guardsquare/proguard/releases/download/v7.9.1/proguard-7.9.1.zip -o proguard.zip
+          cat > SHA256SUMS <<'EOF'
+          f7686c4960cf70c2ebc5c500a73a8cfc04541b730c18f1c5c21329889b137f45  ecj.jar
+          f86f41bfb4097e4bd9cdfeca528960f6977cbda0f5785342adef9909a6a3baef  cldc.jar
+          b7f6ed5e0344c7000643ecc114e6edff3587e8e77face546af0e12ffd6dbe826  midp.jar
+          159a5c81f7a293520496b5896e3a2b8d56dff9d8d168b893188fb1a12525c4bb  proguard.zip
+          EOF
+          sha256sum -c SHA256SUMS
+          unzip -p proguard.zip proguard-7.9.1/lib/proguard.jar > proguard.jar
+          echo 'cf36e761a28b4029b9b950880b0c09004eaae70727840e5c65cdc70d381e379d  proguard.jar' | sha256sum -c -
+      - name: Compile and preverify MIDlet
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee probe-build/build.log) 2>&1
+          java -version
+          java -jar probe-build/deps/ecj.jar -source 1.3 -target 1.2 -bootclasspath probe-build/deps/cldc.jar:probe-build/deps/midp.jar -encoding UTF-8 -g:none -d probe-build/classes blackberry/toolchain-probe/src/ge/bb/ToolchainProbe.java
+          cat > probe-build/MANIFEST.MF <<'EOF'
+          Manifest-Version: 1.0
+          MIDlet-Name: ToolchainProbe
+          MIDlet-Version: 0.1.0
+          MIDlet-Vendor: BlackBerry port investigation
+          MIDlet-1: ToolchainProbe,,ge.bb.ToolchainProbe
+          MicroEdition-Configuration: CLDC-1.1
+          MicroEdition-Profile: MIDP-2.0
+          
+          EOF
+          jar cfm probe-build/unverified.jar probe-build/MANIFEST.MF -C probe-build/classes .
+          printf '%s\n' '-microedition' '-dontshrink' '-dontoptimize' '-dontobfuscate' > probe-build/proguard.pro
+          java -jar probe-build/deps/proguard.jar @probe-build/proguard.pro -injars probe-build/unverified.jar -outjars probe-build/ToolchainProbe.jar -libraryjars probe-build/deps/cldc.jar -libraryjars probe-build/deps/midp.jar
+          python3 - <<'PY'
+          import hashlib, struct, zipfile
+          from pathlib import Path
+          p=Path('probe-build/ToolchainProbe.jar')
+          with zipfile.ZipFile(p) as z:
+              classes=[n for n in z.namelist() if n.endswith('.class')]
+              assert classes, 'No classes produced'
+              for n in classes:
+                  magic,minor,major=struct.unpack('>IHH',z.read(n)[:8])
+                  assert (magic,major,minor)==(0xcafebabe,46,0), (n,major,minor)
+              assert b'ge.bb.ToolchainProbe' in z.read('META-INF/MANIFEST.MF')
+          fields=['MIDlet-Name: ToolchainProbe','MIDlet-Version: 0.1.0','MIDlet-Vendor: BlackBerry port investigation','MIDlet-1: ToolchainProbe,,ge.bb.ToolchainProbe','MicroEdition-Configuration: CLDC-1.1','MicroEdition-Profile: MIDP-2.0','MIDlet-Jar-URL: ToolchainProbe.jar','MIDlet-Jar-Size: '+str(p.stat().st_size)]
+          Path('probe-build/ToolchainProbe.jad').write_bytes(('\r\n'.join(fields)+'\r\n').encode())
+          Path('probe-build/SHA256SUMS').write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'  ToolchainProbe.jar\n')
+          print('JAR/JAD built; class version checked. No RAPC or device test performed.')
+          PY
+      - name: Retain outputs and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-me-toolchain-probe
+          path: |
+            probe-build/build.log
+            probe-build/ToolchainProbe.jar
+            probe-build/ToolchainProbe.jad
+            probe-build/SHA256SUMS
+          retention-days: 7
+          if-no-files-found: warn
