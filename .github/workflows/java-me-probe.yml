@@ -1,6 +1,9 @@
 name: Java ME toolchain probe
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - blackberry/toolchain-probe
 permissions:
   contents: read
 jobs:
